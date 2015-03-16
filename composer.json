@@ -1,0 +1,9 @@
+{
+    "name": "jcherniak/large-db-dumper",
+    "description": "Script to dump only tables below a certain size of a MySQL database",
+    "require": {
+        "php": ">=5.4.0",
+        "ifsnop/mysqldump-php": "1.*",
+        "corneltek/getoptionkit": "~2.0"
+    }
+}
