@@ -32,7 +32,8 @@ $specs->add('u|username:', 'Username')->isa('String');
 $specs->add('d|database:', 'Database')->isa('String');
 $specs->add('h|host:', 'Hostname')->isa('String');
 $specs->add('m|maxsize:', 'Max table size (MB)')->isa('Number');
-$specs->add('o|outputfile:', 'Output filename')->isa('File');
+$specs->add('o|outputfile:', 'Output filename')->isa('String');
+$specs->add('i|includetable+?', 'Force include tables')->isa('String');
 
 try
 {
@@ -57,12 +58,18 @@ $database = $options['database'];
 $host = $options['host'];
 $max_size = isset($options['maxsize']) ? $options['maxsize'] : 512;
 $output_file = isset($options['outputfile']) ? $options['outputfile'] : $database . '.' . date('Ymd') . '.sql.gz';
+$force_includes = isset($options['includetable']) ? $options['includetable'] : array();
 
 echo "Password for {$username}: ";
 $password = exec('read -s PW; echo $PW'); //fgets(STDIN);
 echo "\n";
 
 echo "Dumping database {$database} on {$host} with a max table size of {$max_size} MB.\n";
+
+if (count($force_includes) > 0)
+{
+   echo "\tIncluding the following tables, regardless of size: " . implode($force_includes, ', ') . "\n";
+}
 
 $db = new PDO("mysql:host={$host};dbname={$database}", $username, $password);
 
@@ -80,7 +87,7 @@ $cmd->setFetchMode(PDO::FETCH_ASSOC);
 $total_size = 0;
 foreach ($cmd->fetchAll() as $row)
 {
-    if ($row['size'] > $max_size)
+    if ($row['size'] > $max_size && !in_array($row['table_name'], $force_includes))
     {
         $empty_tables[] = $row['table_name'];
     }
