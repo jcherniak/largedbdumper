@@ -34,6 +34,7 @@ $specs->add('h|host:', 'Hostname')->isa('String');
 $specs->add('m|maxsize:', 'Max table size (MB)')->isa('Number');
 $specs->add('o|outputfile:', 'Output filename')->isa('String');
 $specs->add('i|includetable+?', 'Force include tables')->isa('String');
+$specs->add('s|sshproxy?', 'Server to SSH proxy through')->isa('String');
 
 try
 {
@@ -59,6 +60,7 @@ $host = $options['host'];
 $max_size = isset($options['maxsize']) ? $options['maxsize'] : 512;
 $output_file = isset($options['outputfile']) ? $options['outputfile'] : $database . '.' . date('Ymd') . '.sql.gz';
 $force_includes = isset($options['includetable']) ? $options['includetable'] : array();
+$sshproxy = isset($options['sshproxy']) ? $options['sshproxy'] : null;
 
 echo "Password for {$username}: ";
 $password = exec('read -s PW; echo $PW'); //fgets(STDIN);
@@ -69,6 +71,13 @@ echo "Dumping database {$database} on {$host} with a max table size of {$max_siz
 if (count($force_includes) > 0)
 {
    echo "\tIncluding the following tables, regardless of size: " . implode($force_includes, ', ') . "\n";
+}
+
+if (!empty($sshproxy))
+{
+   shell_exec("ssh -f -L 3307:localhost:3306 -N {$sshproxy} sleep 60 >> ssh-proxy.log");
+   sleep(2);
+   $host = "localhost;port=3307";
 }
 
 $db = new PDO("mysql:host={$host};dbname={$database}", $username, $password);
