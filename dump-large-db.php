@@ -35,6 +35,9 @@ $specs->add('m|maxsize:', 'Max table size (MB)')->isa('Number');
 $specs->add('o|outputfile:', 'Output filename')->isa('String');
 $specs->add('i|includetable+?', 'Force include tables')->isa('String');
 $specs->add('s|sshproxy?', 'Server to SSH proxy through')->isa('String');
+$specs->add('e|emptytables?', 'Condition for tables to leave empty regardless of size (added to WHERE)')->isa('String');
+$specs->add('p|password?', 'Password (only use in scripts, otherwise it is saved in .bash_history)')->isa('String');
+$specs->add('c|adddropdb', 'Add DROP DATABASE FOO; CREATE DATABASE FOO;');
 
 try
 {
@@ -61,10 +64,17 @@ $max_size = isset($options['maxsize']) ? $options['maxsize'] : 512;
 $output_file = isset($options['outputfile']) ? $options['outputfile'] : $database . '.' . date('Ymd') . '.sql.gz';
 $force_includes = isset($options['includetable']) ? $options['includetable'] : array();
 $sshproxy = isset($options['sshproxy']) ? $options['sshproxy'] : null;
+$always_empty_condition = isset($options['emptytables']) ? $options['emptytables'] : null;
+$password = isset($options['password']) ? $options['password'] : null;
+$adddropdb = isset($options['adddropdb']);
 
-echo "Password for {$username}: ";
-$password = exec('read -s PW; echo $PW'); //fgets(STDIN);
-echo "\n";
+if (empty($password))
+{
+    echo "Password for {$username}: ";
+    //$password = exec('read -s PW; echo $PW'); //fgets(STDIN);
+    $password = fgets(STDIN);
+    echo "\n";
+}
 
 echo "Dumping database {$database} on {$host} with a max table size of {$max_size} MB.\n";
 
@@ -85,96 +95,157 @@ $db = new PDO("mysql:host={$host};dbname={$database}", $username, $password);
 $full_tables = [];
 $empty_tables = [];
 
-$cmd = $db->prepare('SELECT table_name, round(((data_length + index_length) / 1024 / 1024), 2) AS size
-    FROM information_schema.TABLES
-    WHERE table_schema = :schema
-');
-$cmd->execute([':schema' => $database]);
-
-$cmd->setFetchMode(PDO::FETCH_ASSOC);
-
-$total_size = 0;
-foreach ($cmd->fetchAll() as $row)
+$always_empty_tables = [];
+if (!empty($always_empty_condition))
 {
-    if ($row['size'] > $max_size && !in_array($row['table_name'], $force_includes))
+    $sql = <<<SQL
+SELECT table_name
+FROM information_schema.TABLES
+WHERE table_schema = :schema AND ({$always_empty_condition})
+SQL;
+    $cmd = $db->prepare($sql);
+    $cmd->execute([':schema' => $database]);
+
+    $cmd->setFetchMode(PDO::FETCH_ASSOC);
+
+    $total_size = 0;
+    foreach ($cmd->fetchAll() as $row)
     {
         $empty_tables[] = $row['table_name'];
     }
+}
+
+if (empty($always_empty_condition))
+{
+    $always_empty_condition = '1=0';
+}
+
+$cmd = $db->prepare("SELECT table_name, round(((data_length + index_length) / 1024 / 1024), 2) AS size
+    FROM information_schema.TABLES
+    WHERE table_schema = :schema AND NOT ({$always_empty_condition})
+");
+$cmd->execute([':schema' => $database]);
+
+$cmd->setFetchMode(PDO::FETCH_ASSOC);
+$total_size = 0;
+foreach ($cmd->fetchAll() as $row)
+{
+    $table = $row['table_name'];
+
+    if ($row['size'] > $max_size && !in_array($table, $force_includes))
+    {
+        $empty_tables[] = $table;
+    }
     else
     {
-        $full_tables[] = $row['table_name'];
+        $full_tables[] = $table;
         $total_size += $row['size'];
     }
 }
 
 echo "\tTotal uncompressed dump size is roughly {$total_size} MB.\n";
 
-$tmpfile = tempnam(sys_get_temp_dir(), 'largedbdump');
+$tmpfile = sys_get_temp_dir() . '/' . 'largedbdump.' . md5(time());
 echo "\tTemp file prefix is {$tmpfile}.\n";
+
+$cmd = $db->prepare("SHOW GRANTS FOR CURRENT_USER");
+$cmd->execute();
+$cmd->setFetchMode(PDO::FETCH_NUM);
+
+$has_super = false;
+foreach ($cmd->fetchAll() as $row)
+{
+    if (stripos($row[0], 'super') !== FALSE)
+    {
+        $has_super = true;
+    }
+}
 
 try {
     $settings = [
         'include-tables' => $full_tables,
         'add-drop-table' => true,
+        'single-transaction' => $has_super,
     ];
-    
-    $fulldumpfile = $tmpfile . '-full.sql';
-    $fulldump = new Mysqldump($database, $username, $password, $host, 'mysql', $settings);
-    $fulldump->start($fulldumpfile);
+   
+    $fulldumpfile = $emptydumpfile = null; 
+    if (count($full_tables) > 0)
+    {
+        $fulldumpfile = $tmpfile . '-full.sql';
+        $fulldump = new Mysqldump($database, $username, $password, $host, 'mysql', $settings);
+        $fulldump->start($fulldumpfile);
+    }
 
-    $settings['include-tables'] = $empty_tables;
-    $settings['no-data'] = true;
+    if (count($empty_tables) > 0)
+    {
+        $settings['include-tables'] = $empty_tables;
+        $settings['no-data'] = true;
 
-    $emptydumpfile = $tmpfile . '-empty.sql';
-    $emptydump = new Mysqldump($database, $username, $password, $host, 'mysql', $settings);
-    $emptydump->start($emptydumpfile);
+        $emptydumpfile = $tmpfile . '-empty.sql';
+        $emptydump = new Mysqldump($database, $username, $password, $host, 'mysql', $settings);
+        $emptydump->start($emptydumpfile);
+    }
 
-    $outfp = gzopen($output_file, 'w');
+    $writefunc = 'fwrite';
+    $openfunc = 'fopen';
+    $closefunc = 'fclose';
+    if (stripos($output_file, '.gz') !== FALSE)
+    {
+        $writefunc = 'gzwrite';
+        $openfunc = 'gzopen';
+        $closefunc = 'gzclose';
+    }
+
+    $outfp = $openfunc($output_file, 'w');
     if (!$outfp)
     {
         throw new \Exception("Error opening output file '{$output_file}' with gzopen");
     }
 
-    $fp = fopen($fulldumpfile, 'r');
-    if (!$fp)
+    if ($adddropdb)
     {
-        throw new \Exception("Error opening full dump file '{$fulldumpfile}' with fopen");
+        $dropdbstring = <<<DROPDB
+/*!40000 DROP DATABASE IF EXISTS `{$database}`*/;
+
+CREATE DATABASE /*!32312 IF NOT EXISTS*/ `{$database}`;
+
+DROPDB;
+
+        $writefunc($outfp, $dropdbstring);
     }
 
-    while ($data = fread($fp, 1024 * 1024))
+    foreach ([$fulldumpfile, $emptydumpfile] as $sourcefile)
     {
-        if (!gzwrite($outfp, $data))
+        if (empty($sourcefile))
         {
-            throw new \Exception("Error writing data");
+            continue;
         }
-    }
 
-    fclose($fp);
-
-    $fp = fopen($emptydumpfile, 'r');
-    if (!$fp)
-    {
-        throw new \Exception("Error opening full dump file '{$fulldumpfile}' with fopen");
-    }
-
-    while ($data = fread($fp, 1024 * 1024))
-    {
-        if (!gzwrite($outfp, $data))
+        $fp = fopen($sourcefile, 'r');
+        if (!$fp)
         {
-            throw new \Exception("Error writing data");
+            throw new \Exception("Error opening full dump file '{$sourcefile}' with fopen");
         }
+
+        while ($data = fread($fp, 1024 * 1024))
+        {
+            if (!$writefunc($outfp, $data))
+            {
+                throw new \Exception("Error writing data");
+            }
+        }
+
+        fclose($fp);
+        unlink($sourcefile);
     }
 
-    fclose($fp);
-
-    gzclose($outfp);
-
-    unlink($fulldumpfile);
-    unlink($emptydumpfile);
+    $closefunc($outfp);
 
     echo "Success!  Output written to {$output_file}.\n";
     exit(0);
 } catch (\Exception $e) {
-    echo 'mysqldump-php error: ' . $e->getMessage();
+    echo 'mysqldump-php error: ' . get_class($e) . ' - ' . $e->getMessage() . "\n";
+    echo $e->getTraceAsString();
+    echo "\n\n\n"; 
     exit(1);
 }
