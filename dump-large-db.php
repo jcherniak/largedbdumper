@@ -208,7 +208,7 @@ try {
 /*!40000 DROP DATABASE IF EXISTS `{$database}`*/;
 
 CREATE DATABASE /*!32312 IF NOT EXISTS*/ `{$database}`;
-USE DATABASE `{$database}`;
+USE `{$database}`;
 
 DROPDB;
 
